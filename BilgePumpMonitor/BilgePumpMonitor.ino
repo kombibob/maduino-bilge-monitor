@@ -19,6 +19,8 @@
 #include <RTClib.h>
 #include <DHT.h>
 #include "config.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
 // Pin definitions for Maduino Zero 4G (LTE)
 #define LTE_RESET_PIN    6
@@ -38,6 +40,14 @@
 #define HIGH_HUMIDITY_THRESHOLD   85.0    // Alert above this humidity (%)
 #define CHECK_INTERVAL            60000   // Check every 60 seconds
 #define RESET_INTERVAL            3600000 // Reset pump counter every hour
+
+// OLED Display configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1  // Reset pin (or -1 if sharing Arduino reset pin)
+#define SCREEN_ADDRESS 0x3C  // Common I2C address (try 0x3D if 0x3C doesn't work)
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // Global variables
 int pumpCount = 0;
@@ -132,7 +142,23 @@ void setup() {
 
   lastCheckTime = millis();
   lastResetTime = millis();
+
+  // Initialize OLED display
+  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    SerialUSB.println(F("SSD1306 allocation failed"));
+  } else {
+    SerialUSB.println("OLED display initialized");
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0,0);
+    display.println("Bilge Monitor");
+    display.println("Starting...");
+    display.display();
+    delay(2000);
+  }
 }
+
 
 
 void loop() {
@@ -144,6 +170,7 @@ void loop() {
     checkTemperatureHumidity();
     checkPumpThreshold();
     checkAutomaticReports();
+    updateOLEDDisplay();
     lastCheckTime = millis();
 
     SerialUSB.print("Status — Pump: "); SerialUSB.print(pumpCount);
@@ -539,4 +566,44 @@ void checkAutomaticReports() {
     morningReportSent = false;
     eveningReportSent = false;
   }
+}
+
+void updateOLEDDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  
+  // Line 1: Title
+  display.setCursor(0, 0);
+  display.println("BILGE MONITOR");
+  
+  // Line 2: Battery voltage (large text)
+  display.setTextSize(2);
+  display.setCursor(0, 12);
+  display.print(batteryVoltage, 1);
+  display.println(" V");
+  
+  // Line 3: Pump count (large text)
+  display.setCursor(0, 30);
+  display.print("Pump: ");
+  display.println(pumpCount);
+  
+  // Line 4-5: Temperature and Humidity (small text)
+  display.setTextSize(1);
+  display.setCursor(0, 48);
+  display.print("T:");
+  display.print(temperature, 0);
+  display.print("C ");
+  display.print("H:");
+  display.print(humidity, 0);
+  display.println("%");
+  
+  // Line 6: Time
+  DateTime now = rtc.now();
+  display.setCursor(0, 56);
+  char timeStr[12];
+  sprintf(timeStr, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+  display.println(timeStr);
+  
+  display.display();
 }
