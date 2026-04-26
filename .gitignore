@@ -1,0 +1,23 @@
+# Configuration file with sensitive data
+config.h
+
+# Arduino build files
+*.elf
+*.hex
+*.bin
+*.eep
+*.lss
+*.map
+*.sym
+*.o
+*.d
+build/
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
