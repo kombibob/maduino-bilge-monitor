@@ -41,6 +41,14 @@
 #define CHECK_INTERVAL            60000   // Check every 60 seconds
 #define RESET_INTERVAL            3600000 // Reset pump counter every hour
 
+// --- Firmware version banner ---
+#define FW_VERSION "v1.2"
+
+// --- One-way link to the ESP32 gateway (bit-banged UART TX, 9600 baud) ---
+#define BILGE_TX_PIN 3          // wire to ESP32 GPIO16 (RX2); leave ESP32 TX unconnected
+#define BILGE_BAUD   9600
+#define BILGE_BIT_US (1000000UL / BILGE_BAUD)
+
 // OLED Display configuration
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
@@ -68,6 +76,27 @@ bool highHumidityAlertSent = false;
 bool morningReportSent = false;
 bool eveningReportSent = false;
 
+bool waitForNetworkRegistration(unsigned long timeoutMs) {
+  unsigned long start = millis();
+  while (millis() - start < timeoutMs) {
+    Serial1.println("AT+CREG?");
+    delay(500);
+    String resp = "";
+    while (Serial1.available()) {
+      char c = Serial1.read();
+      resp += c;
+      SerialUSB.write(c);
+    }
+    if (resp.indexOf("+CREG: 0,1") >= 0 || resp.indexOf("+CREG: 0,5") >= 0 ||
+        resp.indexOf("+CREG: 1,1") >= 0 || resp.indexOf("+CREG: 1,5") >= 0) {
+      SerialUSB.println("Network registered");
+      return true;
+    }
+    delay(1000);
+  }
+  SerialUSB.println("WARNING: network registration timed out");
+  return false;
+}
 // SMS handling
 String modemBuffer = "";
 String lastSender = "";
@@ -77,10 +106,40 @@ String pendingDeleteIndex = "";
 RTC_DS3231 rtc;
 DHT dht(DHT_PIN, DHT_TYPE);
 
+void bilgeSerialBegin() {
+  pinMode(BILGE_TX_PIN, OUTPUT);
+  digitalWrite(BILGE_TX_PIN, HIGH);   // idle high, like a real UART line
+}
+
+void bilgeSendByte(uint8_t b) {
+  digitalWrite(BILGE_TX_PIN, LOW);           // start bit
+  delayMicroseconds(BILGE_BIT_US);
+  for (uint8_t i = 0; i < 8; i++) {
+    digitalWrite(BILGE_TX_PIN, (b & 0x01) ? HIGH : LOW);
+    b >>= 1;
+    delayMicroseconds(BILGE_BIT_US);
+  }
+  digitalWrite(BILGE_TX_PIN, HIGH);          // stop bit
+  delayMicroseconds(BILGE_BIT_US);
+}
+
+void bilgeSendLine(const String& line) {
+  for (size_t i = 0; i < line.length(); i++) bilgeSendByte((uint8_t)line[i]);
+  bilgeSendByte('\n');
+}
+
 
 void setup() {
   SerialUSB.begin(115200);
+  unsigned long usbStart = millis();
+  while (!SerialUSB && (millis() - usbStart < 3000)) {
+    // wait up to 3s for the USB host to finish reconnecting after reset
+  }
   delay(100);
+  SerialUSB.println("=== BILGE MONITOR " FW_VERSION " ===");
+  SerialUSB.println("=== Compiled: " __DATE__ " " __TIME__ " ===");
+
+  bilgeSerialBegin();
   Serial1.begin(115200);
 
   pinMode(PUMP_INPUT_PIN, INPUT_PULLUP);
@@ -134,6 +193,10 @@ void setup() {
   SerialUSB.print("High temp threshold: "); SerialUSB.print(HIGH_TEMP_THRESHOLD); SerialUSB.println("°C");
   SerialUSB.print("High humidity threshold: "); SerialUSB.print(HIGH_HUMIDITY_THRESHOLD); SerialUSB.println("%");
 
+  SerialUSB.println("Waiting for network registration...");
+  waitForNetworkRegistration(30000);   // up to 30s; proceeds either way after that
+
+  
   DateTime startTime = rtc.now();
   String startupMsg = "Bilge monitor started at ";
   startupMsg += formatDateTime(startTime);
@@ -177,6 +240,10 @@ void loop() {
     SerialUSB.print(", Battery: "); SerialUSB.print(batteryVoltage); SerialUSB.print("V");
     SerialUSB.print(", Temp: "); SerialUSB.print(temperature); SerialUSB.print("°C");
     SerialUSB.print(", Humidity: "); SerialUSB.print(humidity); SerialUSB.println("%");
+        char bilgeMsg[64];
+    snprintf(bilgeMsg, sizeof(bilgeMsg), "$BILGE,%.2f,%d,%.1f,%.1f",
+             batteryVoltage, pumpCount, temperature, humidity);
+    bilgeSendLine(String(bilgeMsg));
   }
 
   if (millis() - lastResetTime >= RESET_INTERVAL) {
