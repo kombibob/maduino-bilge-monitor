@@ -19,16 +19,28 @@ void setup() {
   builder.set_hostname("bilge-esp32")->set_wifi_access_point("bilge-esp32", "bilgesetup")->set_sk_server("10.48.10.1", 3000)->get_app();
 
   auto* voltage_sensor = new RepeatSensor<float>(2000, []() { return bilge_voltage; });
-  voltage_sensor->connect_to(new SKOutputFloat("electrical.batteries.bilge.voltage"));
+  voltage_sensor->connect_to(new SKOutputFloat(
+      "electrical.batteries.bilge.voltage",
+      new SKMetadata("V", "Bilge Battery Voltage",
+                     "Battery voltage at the bilge monitor")));
 
   auto* cycles_sensor = new RepeatSensor<float>(2000, []() { return bilge_cycles; });
-  cycles_sensor->connect_to(new SKOutputFloat("electrical.pumps.bilge.cycles"));
+  cycles_sensor->connect_to(new SKOutputFloat(
+      "electrical.pumps.bilge.cycles",
+      new SKMetadata("", "Bilge Pump Cycles",
+                     "Number of bilge pump activations in the current reset period")));
 
   auto* temp_sensor = new RepeatSensor<float>(5000, []() { return bilge_temp; });
-  temp_sensor->connect_to(new SKOutputFloat("environment.inside.bilge.temperature"));
+  temp_sensor->connect_to(new SKOutputFloat(
+      "environment.inside.bilge.temperature",
+      new SKMetadata("K", "Bilge Temperature",
+                     "Temperature inside the bilge compartment")));
 
   auto* humidity_sensor = new RepeatSensor<float>(5000, []() { return bilge_humidity; });
-  humidity_sensor->connect_to(new SKOutputFloat("environment.inside.bilge.relativeHumidity"));
+  humidity_sensor->connect_to(new SKOutputFloat(
+      "environment.inside.bilge.relativeHumidity",
+      new SKMetadata("ratio", "Bilge Humidity",
+                     "Relative humidity inside the bilge compartment")));
 }
 
 void loop() {
