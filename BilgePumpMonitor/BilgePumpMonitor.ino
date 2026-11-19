@@ -3,13 +3,22 @@
 // Monitors bilge pump cycles, battery voltage, temperature and humidity.
 // Sends SMS alerts when thresholds are exceeded.
 // Responds to SMS commands for remote status and control.
+// Pump guard: times how long the Water Witch calls for the pump and, if the
+// pump runs too long, holds it off through the K1 interrupt relay with an
+// escalating auto-retry lockout (see PumpGuard.h).
 //
 // Hardware:
 //   - Maduino Zero 4G (SIM7600E LTE module)
 //   - DS3231 RTC module (I2C)
 //   - DHT11 temperature/humidity sensor
 //   - DFRobot 25V voltage sensor on A0
-//   - Bilge pump signal on pin 10 (active LOW)
+//   - K2 demand contact on pin 10 (active LOW: Water Witch is calling)
+//   - PC817 pump-feed module on A1 (active LOW: voltage at the pump)
+//   - K1 interrupt relay driven from pin 4 through NPN Q1 (HIGH = pump held off)
+//
+// Libraries: Adafruit SleepyDog (new, for the watchdog), RTClib, DHT,
+//            Adafruit GFX, Adafruit SSD1306. PumpGuard.h must sit in the
+//            same folder as this sketch.
 //
 // Configuration:
 //   Copy config.h.example to config.h and fill in your details.
@@ -21,6 +30,8 @@
 #include "config.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Adafruit_SleepyDog.h>
+#include "PumpGuard.h"
 
 // Pin definitions for Maduino Zero 4G (LTE)
 #define LTE_RESET_PIN    6
@@ -28,7 +39,9 @@
 #define LTE_FLIGHT_PIN   7
 
 // Monitoring pins
-#define PUMP_INPUT_PIN   10   // Active LOW pump signal (confirmed working)
+#define DEMAND_PIN       10   // K2 contact to ground: LOW = Water Witch is calling for the pump
+#define FEED_PIN         A1   // PC817 module output: LOW = voltage present at the pump
+#define K1_PIN           4    // Drives Q1 -> K1 interrupt relay: HIGH = pump held off
 #define BATTERY_PIN      A0   // DFRobot 25V voltage sensor
 #define DHT_PIN          2
 #define DHT_TYPE         DHT11
@@ -41,8 +54,16 @@
 #define CHECK_INTERVAL            60000   // Check every 60 seconds
 #define RESET_INTERVAL            3600000 // Reset pump counter every hour
 
+// --- Pump guard (run-time cutout) ---
+// The lockout schedule (10, 30, 60, then 120 minutes) lives in PumpGuard.h.
+#define GUARD_START_ENFORCING   false   // false = log-only after every reboot, true = cut the pump
+#define GUARD_RUN_LIMIT_S       180     // pump may run this long nonstop before the guard trips
+#define GUARD_LOW_BATT_V        11.8    // below this, a trip jumps straight to the longest lockout
+#define WDT_TIMEOUT_MS          16000   // hardware watchdog (SAMD21 maximum is about 16 s)
+#define PUMP_LINE_INTERVAL      10000   // send a $PUMP status line to the ESP32 at least this often (ms)
+
 // --- Firmware version banner ---
-#define FW_VERSION "v1.2"
+#define FW_VERSION "v1.3"
 
 // --- One-way link to the ESP32 gateway (bit-banged UART TX, 9600 baud) ---
 #define BILGE_TX_PIN 3          // wire to ESP32 GPIO16 (RX2); leave ESP32 TX unconnected
@@ -57,6 +78,9 @@
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
+// Explicit prototype: the IDE's automatic prototypes can trip over nested types.
+String guardEventText(const PumpGuard::Event& ev);
+
 // Global variables
 int pumpCount = 0;
 bool lastPumpState = false;
@@ -69,6 +93,11 @@ bool lowVoltageAlertSent = false;
 bool highPumpAlertSent = false;
 bool highTempAlertSent = false;
 bool highHumidityAlertSent = false;
+
+// Pump guard
+PumpGuard guard;
+bool wdtEnabled = false;
+unsigned long lastPumpLine = 0;
 
 // Automatic status report flags
 // Note: morning and evening reports are implemented but currently disabled.
@@ -129,7 +158,33 @@ void bilgeSendLine(const String& line) {
 }
 
 
+// Delay that keeps the watchdog fed (used for the long SMS waits).
+void delayWD(unsigned long ms) {
+  unsigned long start = millis();
+  while (millis() - start < ms) {
+    if (wdtEnabled) Watchdog.reset();
+    delay(10);
+  }
+}
+
+
+// Why did the Maduino last reset? Best effort, read from the SAMD21 reset-cause register.
+const char* resetCauseText() {
+  uint8_t r = PM->RCAUSE.reg;
+  if (r & PM_RCAUSE_WDT)  return "watchdog";
+  if (r & PM_RCAUSE_SYST) return "software";
+  if (r & PM_RCAUSE_EXT)  return "reset button";
+  if (r & (PM_RCAUSE_BOD12 | PM_RCAUSE_BOD33)) return "brownout";
+  if (r & PM_RCAUSE_POR)  return "power-on";
+  return "unknown";
+}
+
+
 void setup() {
+  // First thing: K1 off, so the pump is enabled whatever happens next.
+  pinMode(K1_PIN, OUTPUT);
+  digitalWrite(K1_PIN, LOW);
+
   SerialUSB.begin(115200);
   unsigned long usbStart = millis();
   while (!SerialUSB && (millis() - usbStart < 3000)) {
@@ -138,12 +193,21 @@ void setup() {
   delay(100);
   SerialUSB.println("=== BILGE MONITOR " FW_VERSION " ===");
   SerialUSB.println("=== Compiled: " __DATE__ " " __TIME__ " ===");
+  SerialUSB.print("Reset cause: "); SerialUSB.println(resetCauseText());
 
   bilgeSerialBegin();
   Serial1.begin(115200);
 
-  pinMode(PUMP_INPUT_PIN, INPUT_PULLUP);
+  pinMode(DEMAND_PIN, INPUT_PULLUP);
+  pinMode(FEED_PIN, INPUT_PULLUP);
   pinMode(BATTERY_PIN, INPUT);
+
+  // Pump guard configuration
+  PumpGuard::Config gc = PumpGuard::defaultConfig();
+  gc.runLimitMs = GUARD_RUN_LIMIT_S * 1000UL;
+  gc.lowBattV   = GUARD_LOW_BATT_V;
+  gc.enforce    = GUARD_START_ENFORCING;
+  guard.configure(gc);
 
   dht.begin();
 
@@ -192,15 +256,22 @@ void setup() {
   SerialUSB.print("Low voltage threshold: "); SerialUSB.print(LOW_VOLTAGE_THRESHOLD); SerialUSB.println("V");
   SerialUSB.print("High temp threshold: "); SerialUSB.print(HIGH_TEMP_THRESHOLD); SerialUSB.println("°C");
   SerialUSB.print("High humidity threshold: "); SerialUSB.print(HIGH_HUMIDITY_THRESHOLD); SerialUSB.println("%");
+  SerialUSB.print("Pump guard: "); SerialUSB.print(guard.enforce() ? "ENFORCING" : "LOG-ONLY");
+  SerialUSB.print(", run limit "); SerialUSB.print(GUARD_RUN_LIMIT_S); SerialUSB.println("s");
 
   SerialUSB.println("Waiting for network registration...");
   waitForNetworkRegistration(30000);   // up to 30s; proceeds either way after that
 
-  
+
   DateTime startTime = rtc.now();
   String startupMsg = "Bilge monitor started at ";
   startupMsg += formatDateTime(startTime);
   startupMsg += ". Monitoring pump, battery, temp & humidity.";
+  startupMsg += " Guard ";
+  startupMsg += guard.enforce() ? "ENFORCING" : "LOG-ONLY";
+  startupMsg += ". Reset: ";
+  startupMsg += resetCauseText();
+  startupMsg += ".";
   sendSMS(ALERT_PHONE, startupMsg);
 
   lastCheckTime = millis();
@@ -220,11 +291,22 @@ void setup() {
     display.display();
     delay(2000);
   }
+
+  // Start the guard from the real input states, then arm the watchdog.
+  // A watchdog reset drops every pin to an input, Q1's pull-down turns K1 off
+  // and the pump is enabled again.
+  guard.begin(millis(), digitalRead(DEMAND_PIN) == LOW, digitalRead(FEED_PIN) == LOW);
+  int wdtMs = Watchdog.enable(WDT_TIMEOUT_MS);
+  wdtEnabled = true;
+  SerialUSB.print("Watchdog enabled, timeout ms: "); SerialUSB.println(wdtMs);
 }
 
 
 
 void loop() {
+  if (wdtEnabled) Watchdog.reset();
+
+  guardTick();            // pump guard first: K1 must not wait behind modem work
   handleModemCommunication();
   checkPumpState();
 
@@ -259,8 +341,190 @@ void loop() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Pump guard
+// ---------------------------------------------------------------------------
+
+// Short text for the OLED and STATUS reply: OK / RUN / CUT, with -L in log-only mode.
+String guardShort() {
+  const char* s = "OK";
+  if (guard.state() == PumpGuard::LOCKOUT) s = "CUT";
+  else if (guard.state() == PumpGuard::RUNNING) s = "RUN";
+  String r = s;
+  if (!guard.enforce()) r += "-L";
+  return r;
+}
+
+
+// "45s", "12m", "2.5h"
+String fmtDuration(uint32_t ms) {
+  uint32_t s = ms / 1000UL;
+  if (s < 120) return String(s) + "s";
+  uint32_t m = s / 60UL;
+  if (m < 120) return String(m) + "m";
+  return String(m / 60.0, 1) + "h";
+}
+
+
+String guardStatusText() {
+  uint32_t now = millis();
+  String r = "Guard ";
+  r += guard.enforce() ? "ENFORCING" : "LOG-ONLY";
+  r += ": ";
+  switch (guard.state()) {
+    case PumpGuard::IDLE:
+      r += "idle";
+      break;
+    case PumpGuard::RUNNING:
+      r += "pump running ";
+      r += fmtDuration(guard.runElapsedMs(now));
+      break;
+    case PumpGuard::LOCKOUT:
+      r += "CUT, ";
+      r += fmtDuration(guard.lockoutRemainingMs(now));
+      r += " left (trip ";
+      r += String(guard.tripCount());
+      r += ")";
+      break;
+  }
+  r += ". Last run ";
+  r += fmtDuration(guard.lastRunMs());
+  r += ", max ";
+  r += fmtDuration(guard.maxRunMs());
+  r += ", limit ";
+  r += fmtDuration(guard.runLimitMs());
+  r += ".";
+  if (guard.faultMask()) {
+    r += " FAULT code ";
+    r += String(guard.faultMask());
+  }
+  return r;
+}
+
+
+const char* guardFaultName(uint8_t evType) {
+  switch (evType) {
+    case PumpGuard::EV_FAULT_FEED_DEAD:      return "no feed while Water Witch calling";
+    case PumpGuard::EV_FAULT_LIVE_WHILE_CUT: return "feed live while cut";
+    case PumpGuard::EV_FAULT_LIVE_NO_DEMAND: return "feed live with no demand";
+  }
+  return "fault";
+}
+
+
+// Turns a guard event into SMS text. Returns "" when no SMS should be sent.
+String guardEventText(const PumpGuard::Event& ev) {
+  String stamp = formatDateTime(rtc.now());
+  String m;
+
+  switch (ev.type) {
+    case PumpGuard::EV_TRIP:
+      // Limit SMS volume on a long fault: trips 1-4, then every third trip.
+      if (ev.n > 4 && (ev.n % 3) != 0) return "";
+      m = "ALERT " + stamp + ": Pump ran " + fmtDuration(ev.a) + " nonstop. CUT for " +
+          fmtDuration(ev.b) + " (trip " + String(ev.n) + "). Batt " + String(batteryVoltage, 1) + "V.";
+      break;
+
+    case PumpGuard::EV_WOULD_TRIP:
+      m = "NOTE " + stamp + ": Pump has run " + fmtDuration(ev.a) + " nonstop (limit " +
+          fmtDuration(guard.runLimitMs()) + "). LOG-ONLY, not cut.";
+      break;
+
+    case PumpGuard::EV_RETRY:
+      SerialUSB.println("Guard: lockout ended, pump released for retry " + String(ev.n));
+      return "";
+
+    case PumpGuard::EV_CLEARED:
+      m = "OK " + stamp + ": Pump finished a " + fmtDuration(ev.a) + " run after " +
+          String(ev.n) + " cut(s). Guard reset.";
+      break;
+
+    case PumpGuard::EV_CLEARED_EARLY:
+      m = "OK " + stamp + ": Water Witch cleared while pump was held off (" + String(ev.n) +
+          " cut(s)). Pump released, guard reset.";
+      break;
+
+    case PumpGuard::EV_FAULT_FEED_DEAD:
+      m = String(ev.a ? "REMINDER " : "FAULT ") + stamp +
+          ": Water Witch calling but no voltage at pump. Check R1, fuse, wiring.";
+      break;
+
+    case PumpGuard::EV_FAULT_LIVE_WHILE_CUT:
+      m = String(ev.a ? "REMINDER " : "FAULT ") + stamp +
+          ": Pump live while cut. K1/R1 stuck or manual override is ON.";
+      break;
+
+    case PumpGuard::EV_FAULT_LIVE_NO_DEMAND:
+      m = String(ev.a ? "REMINDER " : "FAULT ") + stamp +
+          ": Pump live with no Water Witch demand. Override ON or R1 stuck.";
+      break;
+
+    case PumpGuard::EV_FAULT_RECOVERED:
+      m = "OK " + stamp + ": Pump fault cleared (" + String(guardFaultName(ev.n)) + ").";
+      break;
+
+    default:
+      return "";
+  }
+  return m;
+}
+
+
+void handleGuardEvents() {
+  PumpGuard::Event ev;
+  while (guard.popEvent(ev)) {
+    String msg = guardEventText(ev);
+    if (msg.length() > 0) sendSMS(ALERT_PHONE, msg);
+  }
+}
+
+
+// $PUMP,state,cut,demand,feed,enforce,trips,lastRunS,maxRunS,faultMask,lockoutLeftS
+// state: 0 idle, 1 running, 2 lockout. faultMask: 1 feed dead, 2 live while cut, 4 live no demand.
+void sendPumpLine() {
+  uint32_t now = millis();
+  char buf[80];
+  snprintf(buf, sizeof(buf), "$PUMP,%d,%d,%d,%d,%d,%d,%lu,%lu,%d,%lu",
+           (int)guard.state(), guard.cut() ? 1 : 0, guard.demand() ? 1 : 0,
+           guard.feed() ? 1 : 0, guard.enforce() ? 1 : 0, (int)guard.tripCount(),
+           (unsigned long)(guard.lastRunMs() / 1000UL),
+           (unsigned long)(guard.maxRunMs() / 1000UL),
+           (int)guard.faultMask(),
+           (unsigned long)(guard.lockoutRemainingMs(now) / 1000UL));
+  bilgeSendLine(String(buf));
+  lastPumpLine = now;
+}
+
+
+// Runs every loop.
+void guardTick() {
+  bool demandRaw = (digitalRead(DEMAND_PIN) == LOW);
+  bool feedRaw   = (digitalRead(FEED_PIN) == LOW);
+
+  guard.update(millis(), demandRaw, feedRaw, batteryVoltage);
+
+  // Apply the output before anything slow (SMS) so a cut is never delayed.
+  digitalWrite(K1_PIN, guard.cut() ? HIGH : LOW);
+
+  // OLED and ESP32 line on any change, and the ESP32 line at least every PUMP_LINE_INTERVAL.
+  static uint16_t lastSig = 0xFFFF;
+  uint16_t sig = (uint16_t)guard.state() |
+                 (uint16_t)((guard.cut() ? 1 : 0) << 2) |
+                 (uint16_t)((guard.demand() ? 1 : 0) << 3) |
+                 (uint16_t)((guard.feed() ? 1 : 0) << 4) |
+                 (uint16_t)((uint16_t)guard.faultMask() << 5);
+  bool changed = (sig != lastSig);
+  lastSig = sig;
+  if (changed) updateOLEDDisplay();
+  if (changed || (millis() - lastPumpLine) >= PUMP_LINE_INTERVAL) sendPumpLine();
+
+  handleGuardEvents();
+}
+
+
 void checkPumpState() {
-  bool currentPumpState = !digitalRead(PUMP_INPUT_PIN); // Active LOW
+  // Count a cycle each time the pump feed goes live (the pump actually ran).
+  bool currentPumpState = guard.feed();
   if (currentPumpState && !lastPumpState) {
     pumpCount++;
     SerialUSB.print("Pump cycle detected! Count: ");
@@ -353,10 +617,10 @@ void sendSMS(String phoneNumber, String message) {
   Serial1.print("AT+CMGS=\"");
   Serial1.print(phoneNumber);
   Serial1.println("\"");
-  delay(1000);
+  delayWD(1000);
   Serial1.print(message);
   Serial1.write(26); // Ctrl+Z
-  delay(5000);
+  delayWD(5000);
   SerialUSB.println("SMS sent");
 }
 
@@ -470,7 +734,8 @@ void processSMSCommand(String command) {
     reply += temperature;
     reply += "C, Humidity: ";
     reply += humidity;
-    reply += "%";
+    reply += "%, Guard ";
+    reply += guardShort();
 
   } else if (command == "SENSORS") {
     DateTime now = rtc.now();
@@ -546,8 +811,32 @@ void processSMSCommand(String command) {
     checkTemperatureHumidity();
     reply = "Humidity test alert sent.";
 
+  } else if (command == "GUARD") {
+    reply = guardStatusText();
+
+  } else if (command == "GUARD LOG") {
+    guard.setEnforce(false);
+    reply = "Guard LOG-ONLY: pump will not be cut. Returns to the programmed default after a reboot.";
+
+  } else if (command == "GUARD ENFORCE") {
+    guard.setEnforce(true);
+    reply = "Guard ENFORCING: pump is cut if it runs " + fmtDuration(guard.runLimitMs()) + " nonstop.";
+
+  } else if (command == "GUARD CLEAR") {
+    guard.clear(millis());
+    reply = "Guard cleared: pump released, trip count reset.";
+
+  } else if (command.startsWith("GUARD LIMIT ")) {
+    long secs = command.substring(12).toInt();
+    if (secs >= 30 && secs <= 3600) {
+      guard.setRunLimitMs((uint32_t)secs * 1000UL);
+      reply = "Run limit set to " + String(secs) + "s until next reboot.";
+    } else {
+      reply = "Limit must be 30 to 3600 seconds.";
+    }
+
   } else if (command == "HELP") {
-    reply = "Commands: STATUS, SENSORS, TIME, SET TIME, RESET ALL/VOLTAGE/PUMP/TEMP/HUMIDITY, TEST VOLTAGE/PUMP/TEMP/HUMIDITY, HELP";
+    reply = "Commands: STATUS, SENSORS, TIME, SET TIME, RESET ALL/VOLTAGE/PUMP/TEMP/HUMIDITY, TEST VOLTAGE/PUMP/TEMP/HUMIDITY, GUARD [LOG/ENFORCE/CLEAR/LIMIT n], HELP";
 
   } else {
     reply = "Unknown command. Send HELP for list.";
@@ -639,22 +928,24 @@ void updateOLEDDisplay() {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  
-  // Line 1: Title
+
+  // Line 1: Title, with the pump guard state at the right (OK / RUN / CUT, -L = log-only)
   display.setCursor(0, 0);
   display.println("BILGE MONITOR");
-  
+  display.setCursor(84, 0);
+  display.print(guardShort());
+
   // Line 2: Battery voltage (large text)
   display.setTextSize(2);
   display.setCursor(0, 12);
   display.print(batteryVoltage, 1);
   display.println(" V");
-  
+
   // Line 3: Pump count (large text)
   display.setCursor(0, 30);
   display.print("Pump: ");
   display.println(pumpCount);
-  
+
   // Line 4-5: Temperature and Humidity (small text)
   display.setTextSize(1);
   display.setCursor(0, 48);
@@ -664,13 +955,13 @@ void updateOLEDDisplay() {
   display.print("H:");
   display.print(humidity, 0);
   display.println("%");
-  
+
   // Line 6: Time
   DateTime now = rtc.now();
   display.setCursor(0, 56);
   char timeStr[12];
   sprintf(timeStr, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
   display.println(timeStr);
-  
+
   display.display();
 }
