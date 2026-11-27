@@ -63,7 +63,7 @@
 #define PUMP_LINE_INTERVAL      10000   // send a $PUMP status line to the ESP32 at least this often (ms)
 
 // --- Firmware version banner ---
-#define FW_VERSION "v1.3"
+#define FW_VERSION "v1.3.1"
 
 // --- One-way link to the ESP32 gateway (bit-banged UART TX, 9600 baud) ---
 #define BILGE_TX_PIN 3          // wire to ESP32 GPIO16 (RX2); leave ESP32 TX unconnected
@@ -656,6 +656,36 @@ void handleModemCommunication() {
 }
 
 
+// ---- SMS sender check ----
+// Returns the nth double-quoted field of a modem line (1 = first), or "" if absent.
+String quotedField(const String& s, int n) {
+  int pos = -1;
+  for (int i = 0; i < n * 2 - 1; i++) {      // step to the opening quote of field n
+    pos = s.indexOf('"', pos + 1);
+    if (pos < 0) return "";
+  }
+  int end = s.indexOf('"', pos + 1);
+  if (end < 0) return "";
+  return s.substring(pos + 1, end);
+}
+
+// The last 'count' digits of a phone number, so +61408436241 and 0408436241 compare equal.
+String lastDigits(const String& s, int count) {
+  String d = "";
+  for (unsigned i = 0; i < s.length(); i++) {
+    if (s[i] >= '0' && s[i] <= '9') d += s[i];
+  }
+  if ((int)d.length() > count) d = d.substring(d.length() - count);
+  return d;
+}
+
+bool isAuthorisedSender(const String& sender) {
+  String a = lastDigits(sender, 9);
+  return a.length() >= 8 && a == lastDigits(String(ALERT_PHONE), 9);
+}
+// ---- end sender check ----
+
+
 void processModemResponse(String response) {
   response.trim();
 
@@ -671,12 +701,11 @@ void processModemResponse(String response) {
       Serial1.println(msgIndex);
     }
   } else if (response.indexOf("+CMGR:") >= 0) {
-    int quoteStart = response.indexOf('"', response.indexOf('"') + 1) + 1;
-    int quoteEnd = response.indexOf('"', quoteStart);
-    if (quoteEnd > quoteStart) {
-      lastSender = response.substring(quoteStart, quoteEnd);
-      SerialUSB.println("SMS from: " + lastSender);
-    }
+    // Header looks like: +CMGR: "REC UNREAD","+614xxxxxxxx","","26/11/26,20:13:44+40"
+    // The sender is the second quoted field.
+    lastSender = quotedField(response, 2);
+    if (lastSender.length() == 0) lastSender = "?";   // unreadable sender: treated as unauthorised
+    SerialUSB.println("SMS from: " + lastSender);
   } else if (response.length() > 0 &&
              !response.startsWith("AT") &&
              !response.startsWith("OK") &&
@@ -686,8 +715,10 @@ void processModemResponse(String response) {
              !response.startsWith("CONNECT")) {
 
     if (lastSender.length() > 0) {
-      if (lastSender == ALERT_PHONE) {
-        SerialUSB.println("Ignoring SMS from own device");
+      if (!isAuthorisedSender(lastSender)) {
+        // Commands are accepted only from ALERT_PHONE. Anything else is dropped
+        // and deleted from the SIM without a reply.
+        SerialUSB.println("Ignoring SMS from unauthorised sender: " + lastSender);
         lastSender = "";
         if (pendingDeleteIndex.length() > 0) {
           deleteSMS(pendingDeleteIndex);

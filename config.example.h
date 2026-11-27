@@ -5,7 +5,8 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-// Phone number to receive SMS alerts
+// Phone number to receive SMS alerts. This is also the only number the device
+// accepts SMS commands from; commands from any other number are ignored.
 #define ALERT_PHONE "+61400000000"
 
 // SMS Service Centre number for your carrier
